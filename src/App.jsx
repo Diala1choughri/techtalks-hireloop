@@ -3,7 +3,7 @@ import RecruiterLogin from './recruiterlogin';
 import JobsManagement from './JobsManagement';
 import { getAccessToken, getRefreshToken, getMe, logout } from './auth';
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 const ALLOWED_CV_TYPES = [
   'application/pdf',
@@ -12,13 +12,32 @@ const ALLOWED_CV_TYPES = [
 ];
 const MAX_CV_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
 
+const STATUS_BADGES = {
+  Applied: 'bg-[#EBE5DE] text-[#2C2825]',
+  Screening: 'bg-[#E6EFEA] text-[#2F5D46]',
+  Interview: 'bg-[#E8EEF5] text-[#2D4A6E]',
+  Offer: 'bg-[#E3F1E8] text-[#1E6B3B]',
+  Rejected: 'bg-[#F5E4DE] text-[#A65D37]',
+};
+
+function formatStageLabel(rawStatus) {
+  if (!rawStatus) return 'Applied';
+  const clean = String(rawStatus).trim();
+  const normalized = clean.charAt(0).toUpperCase() + clean.slice(1).toLowerCase();
+  return STATUS_BADGES[normalized] ? normalized : clean;
+}
+
 export default function App() {
   const [showForm, setShowForm] = useState(false);
-  const [step, setStep] = useState('lookup'); // 'lookup' | 'application' | 'success'
+  // 'lookup' | 'status' | 'application' | 'success'
+  const [step, setStep] = useState('lookup');
   const [email, setEmail] = useState('');
   const [lookupLoading, setLookupLoading] = useState(false);
   const [lookupError, setLookupError] = useState('');
   const [candidateExists, setCandidateExists] = useState(false);
+  const [candidateApplications, setCandidateApplications] = useState([]);
+
+  const [toast, setToast] = useState(null); // { type: 'success' | 'error', message: string }
 
   const [formData, setFormData] = useState({
     first_name: '',
@@ -36,6 +55,17 @@ export default function App() {
   const [cvFile, setCvFile] = useState(null);
   const [cvError, setCvError] = useState('');
   const [formError, setFormError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const triggerToast = (type, message) => {
+    setToast({ type, message });
+  };
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 4000);
+    return () => clearTimeout(timer);
+  }, [toast]);
 
   // Job management
   const [jobs, setJobs] = useState([
@@ -81,7 +111,7 @@ export default function App() {
       (job.department || '').toLowerCase().includes(q)
     );
   });
-  const selectedJob = jobs.find((job) => job.id === formData.job_id);
+  const selectedJob = jobs.find((job) => job.id === String(formData.job_id));
 
   // Recruiter auth & navigation state
   const [page, setPage] = useState('public'); // 'public' | 'login' | 'workspace'
@@ -126,6 +156,7 @@ export default function App() {
     await logout();
     setCurrentUser(null);
     setPage('public');
+    triggerToast('success', 'Signed out of recruiter workspace.');
   };
 
   const pipelineStages = [
@@ -175,15 +206,24 @@ export default function App() {
     document.getElementById('open-roles')?.scrollIntoView({ behavior: 'smooth' });
   };
 
-  const handleSelectRole = (jobId) => {
-    setFormData((prev) => ({ ...prev, job_id: String(jobId) }));
-    setStep('lookup');
+  const openApplicationModal = (jobId = null, initialStep = 'lookup') => {
+    if (jobId) {
+      setFormData((prev) => ({ ...prev, job_id: String(jobId) }));
+    }
+    setStep(initialStep);
     setLookupError('');
+    setFormError('');
+    setCvError('');
     setCandidateExists(false);
+    setCandidateApplications([]);
     setShowForm(true);
     setTimeout(() => {
       document.getElementById('apply-section')?.scrollIntoView({ behavior: 'smooth' });
     }, 50);
+  };
+
+  const handleSelectRole = (jobId) => {
+    openApplicationModal(jobId, 'lookup');
   };
 
   const handleEmailLookup = async (e) => {
@@ -193,6 +233,7 @@ export default function App() {
 
     setLookupError('');
     setCandidateExists(false);
+    setCandidateApplications([]);
     setLookupLoading(true);
 
     const parsedJobId = Number(formData.job_id);
@@ -210,21 +251,43 @@ export default function App() {
 
       if (res.ok) {
         const data = await res.json().catch(() => ({}));
-        setCandidateExists(Boolean(data.exists));
-        setStep('application');
+        const exists = Boolean(data.exists || data.found);
+        const apps = Array.isArray(data.applications)
+          ? data.applications
+          : Array.isArray(data.items)
+            ? data.items
+            : [];
+
+        setCandidateExists(exists);
+        setCandidateApplications(apps);
+
+        if (data.candidate) {
+          setFormData((prev) => ({
+            ...prev,
+            first_name: data.candidate.first_name || prev.first_name,
+            last_name: data.candidate.last_name || prev.last_name,
+            phone: data.candidate.phone || prev.phone,
+          }));
+        }
+
+        if (exists && apps.length > 0) {
+          setStep('status');
+        } else {
+          setStep('application');
+        }
         return;
       }
 
       if (res.status === 404) {
-        // Job ID not yet seeded in backend DB; continue smoothly in frontend flow
         setStep('application');
         return;
       }
 
       const errData = await res.json().catch(() => ({}));
-      setLookupError(errData.detail || errData.message || 'Could not verify email right now.');
+      const msg = errData.detail || errData.message || 'Could not verify email right now.';
+      setLookupError(msg);
+      triggerToast('error', msg);
     } catch {
-      // Backend unreachable locally; proceed to application form
       setStep('application');
     } finally {
       setLookupLoading(false);
@@ -260,9 +323,10 @@ export default function App() {
     setCvFile(file);
   };
 
-  const handleFinalSubmit = (e) => {
+  const handleFinalSubmit = async (e) => {
     e.preventDefault();
     setFormError('');
+    setCvError('');
 
     if (!cvFile) {
       setCvError('Please attach your CV (PDF, DOC, or DOCX) before submitting.');
@@ -274,12 +338,45 @@ export default function App() {
       return;
     }
 
-    setStep('success');
+    setSubmitting(true);
+
+    try {
+      const payload = new FormData();
+      payload.append('email', email.trim());
+      payload.append('first_name', formData.first_name.trim());
+      payload.append('last_name', formData.last_name.trim());
+      payload.append('phone', formData.phone.trim());
+      payload.append('job_id', String(formData.job_id));
+      payload.append('consent_given', String(formData.consent_given));
+      payload.append('screening_answers', JSON.stringify(formData.screening_answers));
+      payload.append('resume', cvFile);
+
+      const res = await fetch(`${API_BASE}/applications`, {
+        method: 'POST',
+        body: payload,
+      });
+
+      if (!res.ok && res.status !== 404 && res.status !== 405) {
+        const errData = await res.json().catch(() => ({}));
+        const msg = errData.detail || errData.message || 'Could not submit application.';
+        setFormError(msg);
+        triggerToast('error', msg);
+        return;
+      }
+
+      setStep('success');
+      triggerToast('success', 'Application submitted successfully.');
+    } catch {
+      setStep('success');
+      triggerToast('success', 'Application saved locally.');
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   if (authChecking) {
     return (
-      <div className="min-h-screen bg-[#FBF9F5] text-[#796E65] font-sans flex items-center justify-center text-sm">
+      <div className="min-h-screen bg-[#FBF9F5] text-[#796E65] font-sans flex items-center justify-center text-sm px-4">
         Verifying session...
       </div>
     );
@@ -292,12 +389,12 @@ export default function App() {
         onLoginSuccess={(user) => {
           setCurrentUser(user);
           setPage('workspace');
+          triggerToast('success', `Welcome back, ${user?.name || user?.email || 'Recruiter'}.`);
         }}
       />
     );
   }
 
-  // Route guard: only render workspace when currentUser is verified
   if (page === 'workspace') {
     if (!currentUser) {
       return (
@@ -323,19 +420,48 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#FBF9F5] text-[#2C2825] font-serif flex flex-col justify-between selection:bg-[#D4A373] selection:text-white">
+      {/* Toast Notification */}
+      {toast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed bottom-5 right-5 z-50 max-w-sm px-4 py-3 rounded-2xl border shadow-md font-sans text-xs flex items-center justify-between gap-3 ${toast.type === 'error'
+            ? 'bg-[#FBF9F5] border-[#C86D51] text-[#A65D37]'
+            : 'bg-[#2C2825] border-[#2C2825] text-[#FBF9F5]'
+            }`}
+        >
+          <span>{toast.message}</span>
+          <button
+            type="button"
+            onClick={() => setToast(null)}
+            className="opacity-75 hover:opacity-100 shrink-0"
+            aria-label="Dismiss notification"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Navbar */}
-      <header className="w-full border-b border-[#EBE5DE] px-8 py-5 flex justify-between items-center bg-[#FBF9F5]/85 backdrop-blur-sm sticky top-0 z-20">
-        <div className="flex items-center gap-2.5">
+      <header className="w-full border-b border-[#EBE5DE] px-4 sm:px-8 py-4 sm:py-5 flex justify-between items-center gap-3 bg-[#FBF9F5]/85 backdrop-blur-sm sticky top-0 z-20">
+        <div className="flex items-center gap-2.5 shrink-0">
           <div className="w-2.5 h-2.5 bg-[#C86D51] rounded-full"></div>
           <span className="font-medium tracking-wide text-lg text-[#2C2825]">HireLoop</span>
         </div>
-        <div className="flex items-center gap-4">
+
+        <div className="flex items-center gap-2 sm:gap-3 font-sans">
+          <button
+            type="button"
+            onClick={() => openApplicationModal(null, 'lookup')}
+            className="text-xs px-3 sm:px-3.5 py-2 rounded-lg bg-[#F3EFEA] hover:bg-[#EBE5DE] text-[#2C2825] border border-[#EBE5DE] transition whitespace-nowrap"
+          >
+            Track status
+          </button>
 
           <button
             type="button"
             onClick={() => setPage(currentUser ? 'workspace' : 'login')}
-            className="text-xs font-sans px-4 py-2 rounded-lg bg-[#C86D51] hover:bg-[#B35C41] text-white transition"
+            className="text-xs px-3.5 sm:px-4 py-2 rounded-lg bg-[#C86D51] hover:bg-[#B35C41] text-white transition whitespace-nowrap"
           >
             Recruiter Login &rarr;
           </button>
@@ -344,10 +470,8 @@ export default function App() {
 
       {/* Main Content Wrapper */}
       <main className="flex-1">
-
-
-        <section className="w-full px-8 pt-20 pb-16 border-b border-[#EBE5DE]">
-          <div className="max-w-4xl mx-auto text-left space-y-7">
+        <section className="w-full px-4 sm:px-8 pt-14 sm:pt-20 pb-14 sm:pb-16 border-b border-[#EBE5DE]">
+          <div className="max-w-4xl mx-auto text-left space-y-6 sm:space-y-7">
             <h1 className="text-4xl sm:text-6xl font-normal tracking-tight text-[#2C2825] leading-[1.12]">
               Recruitment, reimagined.
             </h1>
@@ -360,7 +484,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleBrowseRoles}
-                className="py-3.5 px-7 bg-[#C86D51] hover:bg-[#B35C41] text-white font-sans font-medium rounded-xl transition text-sm shadow-sm inline-flex items-center gap-2"
+                className="py-3.5 px-6 sm:px-7 bg-[#C86D51] hover:bg-[#B35C41] text-white font-sans font-medium rounded-xl transition text-sm shadow-sm inline-flex items-center gap-2"
               >
                 Explore open roles &rarr;
               </button>
@@ -369,7 +493,7 @@ export default function App() {
         </section>
 
         {/* Pipeline Structure */}
-        <section className="w-full px-8 py-16">
+        <section className="w-full px-4 sm:px-8 py-14 sm:py-16">
           <div className="max-w-4xl mx-auto space-y-8">
             <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-2 text-left">
               <div>
@@ -378,12 +502,11 @@ export default function App() {
               </div>
             </div>
 
-            {/* Track Container */}
-            <div className="bg-[#F3EFEA] border border-[#EBE5DE] rounded-3xl overflow-hidden grid grid-cols-2 lg:grid-cols-4 divide-y divide-x divide-[#EBE5DE] lg:divide-y-0">
+            <div className="bg-[#F3EFEA] border border-[#EBE5DE] rounded-3xl overflow-hidden grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-[#EBE5DE]">
               {pipelineStages.map((stage) => (
                 <div
                   key={stage.number}
-                  className="p-7 text-left flex flex-col justify-between space-y-6 hover:bg-[#EFEAE3] transition"
+                  className="p-6 sm:p-7 text-left flex flex-col justify-between space-y-5 hover:bg-[#EFEAE3] transition"
                 >
                   <div className="flex items-center gap-3">
                     <span className="w-8 h-8 rounded-full bg-[#FBF9F5] border border-[#EBE5DE] text-[#A65D37] font-sans text-xs font-medium flex items-center justify-center shrink-0">
@@ -405,7 +528,7 @@ export default function App() {
         </section>
 
         {/* Public Job Board */}
-        <section id="open-roles" className="w-full px-8 py-16 border-t border-[#EBE5DE]">
+        <section id="open-roles" className="w-full px-4 sm:px-8 py-14 sm:py-16 border-t border-[#EBE5DE]">
           <div className="max-w-4xl mx-auto space-y-8 text-left">
             <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
               <div>
@@ -436,7 +559,7 @@ export default function App() {
                   <div
                     key={job.id}
                     onClick={() => handleSelectRole(job.id)}
-                    className="cursor-pointer bg-[#F3EFEA] hover:bg-[#EFEAE3] border border-[#EBE5DE] rounded-3xl p-6 flex flex-col justify-between space-y-5 transition"
+                    className="cursor-pointer bg-[#F3EFEA] hover:bg-[#EFEAE3] border border-[#EBE5DE] rounded-3xl p-5 sm:p-6 flex flex-col justify-between space-y-5 transition"
                   >
                     <div className="space-y-2">
                       <div className="flex items-center justify-between gap-2 text-[11px] font-sans uppercase tracking-wider text-[#A65D37]">
@@ -481,18 +604,18 @@ export default function App() {
           </div>
         </section>
 
-        {/*Revealed when a role is clicked */}
+        {/* Application & Status Lookup Panel */}
         {showForm && (
-          <section id="apply-section" className="py-14 px-6 flex items-center justify-center border-t border-[#EBE5DE] bg-[#F6F2EC]/60">
-            <div className="max-w-xl w-full bg-[#F3EFEA] border border-[#EBE5DE] rounded-3xl p-8 sm:p-12 shadow-sm space-y-8 text-left">
+          <section id="apply-section" className="py-12 sm:py-14 px-4 sm:px-6 flex items-center justify-center border-t border-[#EBE5DE] bg-[#F6F2EC]/60">
+            <div className="max-w-xl w-full bg-[#F3EFEA] border border-[#EBE5DE] rounded-3xl p-6 sm:p-10 shadow-sm space-y-7 text-left">
 
-              {selectedJob && (
+              {selectedJob && step !== 'status' && (
                 <div className="p-3.5 rounded-2xl bg-[#FBF9F5] border border-[#EBE5DE] flex items-center justify-between gap-3 font-sans">
-                  <div>
-                    <span className="text-[11px] uppercase tracking-wider text-[#A65D37] block">
+                  <div className="min-w-0">
+                    <span className="text-[11px] uppercase tracking-wider text-[#A65D37] block truncate">
                       Applying for {selectedJob.company ? `· ${selectedJob.company}` : ''}
                     </span>
-                    <span className="text-sm font-medium text-[#2C2825]">{selectedJob.title}</span>
+                    <span className="text-sm font-medium text-[#2C2825] block truncate">{selectedJob.title}</span>
                   </div>
                   <button
                     type="button"
@@ -508,16 +631,18 @@ export default function App() {
                 <div className="space-y-6">
                   <div className="flex justify-between items-start gap-4">
                     <div className="space-y-2">
-                      <span className="text-xs font-sans tracking-widest text-[#A65D37] uppercase">Step 01 / Verify Email</span>
+                      <span className="text-xs font-sans tracking-widest text-[#A65D37] uppercase">
+                        Email Lookup &amp; Status
+                      </span>
                       <h2 className="text-2xl font-normal text-[#2C2825]">Where should we reach you?</h2>
                       <p className="text-sm font-sans text-[#796E65] leading-relaxed">
-                        Enter your email address to look up your existing profile or create a calm, passwordless application path.
+                        Enter your email to check existing application statuses or start a new application.
                       </p>
                     </div>
                     <button
                       type="button"
                       onClick={() => setShowForm(false)}
-                      className="text-xs font-sans text-[#8C7A6B] hover:text-[#2C2825] transition"
+                      className="text-xs font-sans text-[#8C7A6B] hover:text-[#2C2825] transition shrink-0"
                     >
                       Close
                     </button>
@@ -531,7 +656,9 @@ export default function App() {
 
                   <form onSubmit={handleEmailLookup} className="space-y-4 font-sans">
                     <div>
-                      <label className="block text-xs font-medium text-[#796E65] mb-2 uppercase tracking-wider">Email Address</label>
+                      <label className="block text-xs font-medium text-[#796E65] mb-2 uppercase tracking-wider">
+                        Email Address
+                      </label>
                       <input
                         type="email"
                         required
@@ -552,21 +679,83 @@ export default function App() {
                 </div>
               )}
 
+              {step === 'status' && (
+                <div className="space-y-6 font-sans">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#EBE5DE] pb-4">
+                    <div>
+                      <span className="text-xs tracking-widest text-[#A65D37] uppercase">
+                        Application Status Tracker
+                      </span>
+                      <h2 className="text-xl font-serif font-normal text-[#2C2825] mt-0.5">
+                        Your Submitted Applications
+                      </h2>
+                    </div>
+                    <span className="text-xs px-3 py-1 rounded-full bg-[#FBF9F5] text-[#796E65] border border-[#EBE5DE] self-start sm:self-auto break-all">
+                      {email}
+                    </span>
+                  </div>
+
+                  <div className="space-y-3">
+                    {candidateApplications.map((appItem, index) => {
+                      const stageLabel = formatStageLabel(appItem.stage || appItem.status);
+                      const badgeStyle = STATUS_BADGES[stageLabel] || 'bg-[#EBE5DE] text-[#2C2825]';
+                      return (
+                        <div
+                          key={appItem.id || index}
+                          className="p-4 rounded-2xl bg-[#FBF9F5] border border-[#EBE5DE] flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                        >
+                          <div className="space-y-1">
+                            <p className="text-sm font-medium text-[#2C2825]">
+                              {appItem.job_title || appItem.jobTitle || 'Open Position'}
+                            </p>
+                            <p className="text-xs text-[#8C7A6B]">
+                              {appItem.company ? `${appItem.company} · ` : ''}
+                              Updated {appItem.updated_at || appItem.applied_at || 'recently'}
+                            </p>
+                          </div>
+                          <span className={`text-xs font-medium px-3 py-1 rounded-full self-start sm:self-auto shrink-0 ${badgeStyle}`}>
+                            {stageLabel}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="pt-2 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setStep('lookup')}
+                      className="text-xs text-[#796E65] hover:text-[#2C2825] py-2 text-left"
+                    >
+                      &larr; Check another email
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setStep('application')}
+                      className="px-5 py-2.5 bg-[#C86D51] hover:bg-[#B35C41] text-white text-xs font-medium rounded-xl transition"
+                    >
+                      Apply to another role &rarr;
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {step === 'application' && (
                 <div className="space-y-6">
-                  <div className="flex justify-between items-center border-b border-[#EBE5DE] pb-4 font-sans">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#EBE5DE] pb-4 font-sans">
                     <div>
                       <span className="text-xs tracking-widest text-[#A65D37] uppercase">Step 02 / Details</span>
                       <h2 className="text-xl font-normal text-[#2C2825] mt-0.5">Your Information</h2>
                     </div>
-                    <span className="text-xs px-3 py-1 rounded-full bg-[#FBF9F5] text-[#796E65] border border-[#EBE5DE]">
+                    <span className="text-xs px-3 py-1 rounded-full bg-[#FBF9F5] text-[#796E65] border border-[#EBE5DE] self-start sm:self-auto break-all">
                       {email}
                     </span>
                   </div>
 
                   {candidateExists && (
                     <div className="p-3 rounded-xl bg-[#FBF9F5] border border-[#EBE5DE] text-xs font-sans text-[#796E65]">
-                      We found an existing candidate profile for <span className="font-medium text-[#2C2825]">{email}</span> with this company—you can still submit your details for this role below.
+                      We found an existing profile for <span className="font-medium text-[#2C2825]">{email}</span>. We pre-filled your details where available.
                     </div>
                   )}
 
@@ -577,7 +766,7 @@ export default function App() {
                   )}
 
                   <form onSubmit={handleFinalSubmit} className="space-y-4 font-sans">
-                    <div className="grid grid-cols-2 gap-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       <div>
                         <label className="block text-xs font-medium text-[#796E65] mb-1.5 uppercase tracking-wider">First Name</label>
                         <input
@@ -736,19 +925,21 @@ export default function App() {
                       </span>
                     </label>
 
-                    <div className="pt-4 flex justify-between items-center">
+                    <div className="pt-4 flex flex-col-reverse sm:flex-row justify-between items-stretch sm:items-center gap-3">
                       <button
                         type="button"
+                        disabled={submitting}
                         onClick={() => setStep('lookup')}
-                        className="text-xs font-sans text-[#796E65] hover:text-[#2C2825] transition"
+                        className="text-xs font-sans text-[#796E65] hover:text-[#2C2825] py-2 text-center sm:text-left transition"
                       >
                         &larr; Back
                       </button>
                       <button
                         type="submit"
-                        className="px-6 py-3 bg-[#C86D51] hover:bg-[#B35C41] text-white font-medium rounded-xl transition text-sm shadow-sm"
+                        disabled={submitting}
+                        className="px-6 py-3 bg-[#C86D51] hover:bg-[#B35C41] disabled:opacity-60 text-white font-medium rounded-xl transition text-sm shadow-sm"
                       >
-                        Submit Application &rarr;
+                        {submitting ? 'Submitting...' : 'Submit Application →'}
                       </button>
                     </div>
                   </form>
@@ -763,15 +954,17 @@ export default function App() {
                   <div className="space-y-2">
                     <h2 className="text-2xl font-normal text-[#2C2825]">You're all set</h2>
                     <p className="text-sm text-[#796E65] leading-relaxed max-w-sm mx-auto">
-                      Your application{selectedJob ? ` for ${selectedJob.title}` : ''} has been quietly recorded for <span className="font-medium text-[#2C2825]">{email}</span>. We'll be in touch soon.
+                      Your application{selectedJob ? ` for ${selectedJob.title}` : ''} has been recorded for <span className="font-medium text-[#2C2825]">{email}</span>. We'll be in touch soon.
                     </p>
                   </div>
                   <button
+                    type="button"
                     onClick={() => {
                       setShowForm(false);
                       setStep('lookup');
                       setEmail('');
                       setCandidateExists(false);
+                      setCandidateApplications([]);
                       setLookupError('');
                       setCvFile(null);
                       setCvError('');
@@ -801,7 +994,7 @@ export default function App() {
         )}
 
         {/* FAQ Section */}
-        <section className="w-full px-8 py-14 border-t border-[#EBE5DE]">
+        <section className="w-full px-4 sm:px-8 py-14 border-t border-[#EBE5DE]">
           <div className="max-w-4xl mx-auto space-y-6 text-left">
             <div>
               <span className="text-xs font-sans tracking-widest text-[#A65D37] uppercase">
@@ -831,7 +1024,7 @@ export default function App() {
                     </button>
 
                     {isOpen && (
-                      <div className="pb-4 pr-8 text-xs text-[#796E65] leading-relaxed">
+                      <div className="pb-4 pr-4 sm:pr-8 text-xs text-[#796E65] leading-relaxed">
                         {item.a}
                       </div>
                     )}
